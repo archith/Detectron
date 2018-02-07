@@ -32,9 +32,12 @@ import logging
 import os
 import sys
 import time
+import pandas as pd
+from tqdm import tqdm
 
 from caffe2.python import workspace
 
+sys.path.append('lib')
 from core.config import assert_and_infer_cfg
 from core.config import cfg
 from core.config import merge_cfg_from_file
@@ -44,6 +47,7 @@ import datasets.dummy_datasets as dummy_datasets
 import utils.c2 as c2_utils
 import utils.logging
 import utils.vis as vis_utils
+
 
 c2_utils.import_detectron_ops()
 # OpenCL may be enabled by default in OpenCV3; disable it because it's not
@@ -82,8 +86,26 @@ def parse_args():
         type=str
     )
     parser.add_argument(
-        'im_or_folder', help='image or folder of images', default=None
+        '--image-prefix',
+        dest='image_prefix',
+        help='image file name prefix',
+        default='',
+        type=str
     )
+    parser.add_argument(
+        'im_or_folder',
+        help='image or folder of images',
+        default=None,
+        type=str
+    )
+    parser.add_argument(
+        '--output-csv-file',
+        dest='output_csv_file',
+        help='output csv file with detection files',
+        default='output.csv',
+        type=str
+    )
+
     if len(sys.argv) == 1:
         parser.print_help()
         sys.exit(1)
@@ -91,6 +113,18 @@ def parse_args():
 
 
 def main(args):
+
+    if os.path.isdir(args.im_or_folder):
+        im_list = glob.glob(os.path.join(args.im_or_folder, args.image_prefix + '*.' + args.image_ext))
+    else:
+        assert False, "Has to be a folder with images extracted from images"
+
+    im_list.sort()
+
+    if os.path.isfile(args.output_csv_file):
+        print('CSV file already present : {}'.format(args.output_csv_file))
+        return
+
     logger = logging.getLogger(__name__)
     merge_cfg_from_file(args.cfg)
     cfg.TEST.WEIGHTS = args.weights
@@ -99,46 +133,107 @@ def main(args):
     model = infer_engine.initialize_model_from_cfg()
     dummy_coco_dataset = dummy_datasets.get_coco_dataset()
 
-    if os.path.isdir(args.im_or_folder):
-        im_list = glob.iglob(args.im_or_folder + '/*.' + args.image_ext)
-    else:
-        im_list = [args.im_or_folder]
+    video_name = os.path.basename(args.im_or_folder)
 
-    for i, im_name in enumerate(im_list):
+
+
+    if not os.path.isdir(args.output_dir):
+        os.makedirs(args.output_dir)
+
+    det_bbox_df = pd.DataFrame(columns=[u'video_name', u'image_name', u'box_ymin', u'box_xmin',
+       u'box_ymax', u'box_xmax', u'box_score', u'box_class', u'img_width', u'img_height'])
+
+    video_name_list = []
+    image_name_list = []
+    box_ymin_list = []
+    box_xmin_list = []
+    box_ymax_list = []
+    box_xmax_list = []
+    box_score_list = []
+    class_list = []
+    img_width_list = []
+    img_height_list = []
+
+    logger.info('Processing {} -> {}'.format(args.im_or_folder, args.output_dir))
+    for im_path in tqdm(im_list, desc='{:25}'.format(os.path.basename(args.im_or_folder))):
         out_name = os.path.join(
-            args.output_dir, '{}'.format(os.path.basename(im_name) + '.pdf')
+            args.output_dir, '{}'.format(os.path.basename(im_path))
         )
-        logger.info('Processing {} -> {}'.format(im_name, out_name))
-        im = cv2.imread(im_name)
+        #logger.info('Processing {} -> {}'.format(im_path, out_name))
+        im = cv2.imread(im_path)
+        im_h, im_w, _ = im.shape
+        im_name = os.path.basename(im_path)
+
         timers = defaultdict(Timer)
         t = time.time()
         with c2_utils.NamedCudaScope(0):
             cls_boxes, cls_segms, cls_keyps = infer_engine.im_detect_all(
                 model, im, None, timers=timers
             )
-        logger.info('Inference time: {:.3f}s'.format(time.time() - t))
-        for k, v in timers.items():
-            logger.info(' | {}: {:.3f}s'.format(k, v.average_time))
-        if i == 0:
-            logger.info(
-                ' \ Note: inference on the first image will be slower than the '
-                'rest (caches and auto-tuning need to warm up)'
-            )
+        # logger.info('Inference time: {:.3f}s'.format(time.time() - t))
+        # for k, v in timers.items():
+        #     logger.info(' | {}: {:.3f}s'.format(k, v.average_time))
+        # if i == 0:
+        #     logger.info(
+        #         ' \ Note: inference on the first image will be slower than the '
+        #         'rest (caches and auto-tuning need to warm up)'
+        #     )
+
+        person_boxes = cls_boxes[1]
+
+        # Ignore all classes other than person for visualization
+        viz_boxes = [[] for x in range(len(cls_boxes))]
+        viz_boxes[1] = person_boxes
+
+        for bbox in person_boxes:
+            xmin, ymin, xmax, ymax, score = bbox
+
+            video_name_list.append(video_name)
+            image_name_list.append(im_name)
+
+            box_xmin_list.append(xmin/im_w)
+            box_ymin_list.append(ymin/im_h)
+            box_xmax_list.append(xmax/im_w)
+            box_ymax_list.append(ymax/im_h)
+
+            box_score_list.append(score)
+
+            class_list.append('person')
+
+            img_width_list.append(im_w)
+            img_height_list.append(im_h)
+
 
         vis_utils.vis_one_image(
             im[:, :, ::-1],  # BGR -> RGB for visualization
             im_name,
             args.output_dir,
-            cls_boxes,
-            cls_segms,
-            cls_keyps,
+            viz_boxes,
+            segms=None, #cls_segms,
+            keypoints=None, #cls_keyps,
             dataset=dummy_coco_dataset,
             box_alpha=0.3,
             show_class=True,
             thresh=0.7,
-            kp_thresh=2
+            kp_thresh=2,
+            ext='jpg'
         )
 
+        pass
+
+    det_bbox_df['video_name'] = video_name_list
+    det_bbox_df['image_name'] = image_name_list
+    det_bbox_df['box_ymin'] = box_ymin_list
+    det_bbox_df['box_xmin'] = box_xmin_list
+    det_bbox_df['box_ymax'] = box_ymax_list
+    det_bbox_df['box_xmax'] = box_xmax_list
+    det_bbox_df['box_score'] = box_score_list
+    det_bbox_df['box_class'] = class_list
+    det_bbox_df['img_width'] = img_width_list
+    det_bbox_df['img_height'] = img_height_list
+
+    det_bbox_df.to_csv(args.output_csv_file)
+    print('Write results to {}'.format(args.output_csv_file))
 
 if __name__ == '__main__':
     workspace.GlobalInit(['caffe2', '--caffe2_log_level=0'])
